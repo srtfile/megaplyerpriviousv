@@ -321,7 +321,11 @@ select.fi-sel:focus { border-color: var(--acc); }
     <!-- Status + Save rule -->
     <div class="statusrow">
       <div class="status" id="status">Ready — paste an m3u8 URL above</div>
-      <button class="btn sec" onclick="saveCurrentRule()"
+      <button class="btn sec" id="btnCancelEdit" onclick="cancelEditRule()"
+        style="font-size:.68rem;padding:5px 10px;display:none" title="Discard changes">
+        ✕ Cancel
+      </button>
+      <button class="btn sec" id="btnSaveRule" onclick="saveCurrentRule()"
         style="font-size:.68rem;padding:5px 10px" title="Save Referer+Origin for this CDN">
         💾 Save Rule
       </button>
@@ -411,12 +415,27 @@ function getBaseDomain(hostname) {
   return lastTwo;
 }
 
+// Strips BOTH the subdomain prefix AND the extension, returning just the
+// domain name itself. e.g. "storrrrrrm.site" → "storrrrrrm",
+// "storrrrrrm.me" → "storrrrrrm" — so these two count as the same CDN
+// even though the TLD changed.
+function getDomainNameOnly(hostname) {
+  const parts = (hostname || '').toLowerCase().split('.').filter(Boolean);
+  if (parts.length === 0) return '';
+  if (parts.length === 1) return parts[0];
+  const lastTwo = parts.slice(-2).join('.');
+  if (MULTI_PART_TLDS.has(lastTwo) && parts.length >= 3) {
+    return parts[parts.length - 3];
+  }
+  return parts[parts.length - 2];
+}
+
 // Finds a saved profile for a given hostname.
 //   Priority 1 — exact hostname match (full host incl. subdomain + extension)
-//   Priority 2 — base-domain match (ignore subdomain, match domain+extension only)
-// This means a brand-new random subdomain on a CDN you've already saved
-// (e.g. a new "xxxx.storrrrrrm.site" link) will still auto-match the rule
-// you saved earlier for that same base domain.
+//   Priority 2 — base-domain match (ignore subdomain, same domain+extension)
+//   Priority 3 — domain-name-only match (ignore subdomain AND extension —
+//                e.g. storrrrrrm.site and storrrrrrm.me are treated as the
+//                same saved CDN, but we flag that the extension changed)
 function findMatchingProfile(host, profiles) {
   if (!host || !profiles) return null;
   host = host.toLowerCase();
@@ -429,6 +448,16 @@ function findMatchingProfile(host, profiles) {
       return { key, data, matchType: 'base-domain' };
     }
   }
+
+  const nameOnly = getDomainNameOnly(host);
+  if (nameOnly) {
+    for (const [key, data] of Object.entries(profiles)) {
+      if (getDomainNameOnly(key) === nameOnly) {
+        return { key, data, matchType: 'extension-changed', oldBase: getBaseDomain(key), newBase: base };
+      }
+    }
+  }
+
   return null;
 }
 
@@ -567,11 +596,19 @@ async function onUrlInput() {
       document.getElementById('proxyFormat').value = d.proxyFmt;
     if (d.customUrl && document.getElementById('customProxyUrl'))
       document.getElementById('customProxyUrl').value = d.customUrl;
-    const tag = match.matchType === 'exact' ? '' : ' (base-domain match)';
-    setStatus(`💾 Saved rule applied: ${match.key}${tag}`, 'var(--acc2)');
+
+    if (match.matchType === 'exact') {
+      setStatus(`💾 Saved rule applied: ${match.key}`, 'var(--acc2)');
+    } else if (match.matchType === 'base-domain') {
+      setStatus(`💾 Saved rule applied: ${match.key} (new subdomain, same domain)`, 'var(--acc2)');
+    } else {
+      setStatus(`⚠️ Domain extension changed (${match.oldBase} → ${match.newBase}) — applied saved rule from ${match.key} anyway`, 'var(--acc2)');
+    }
     return;
   }
 }
+
+let editingHost = null; // set while a saved rule is being edited
 
 async function saveCurrentRule() {
   const url        = document.getElementById('urlIn').value.trim();
@@ -582,8 +619,15 @@ async function saveCurrentRule() {
   const customUrl  = document.getElementById('customProxyUrl') ? document.getElementById('customProxyUrl').value.trim() : '';
 
   if (!url) { setStatus('❌ Paste a URL first', 'var(--red)'); return; }
-  let host = '';
-  try { host = new URL(url).hostname.toLowerCase(); } catch { setStatus('❌ Invalid URL', 'var(--red)'); return; }
+
+  // If we're editing an existing saved rule, keep updating that same key
+  // (even if the URL's host text differs slightly) — otherwise derive
+  // the host fresh from the URL, as a normal new save.
+  let host = editingHost;
+  if (!host) {
+    try { host = new URL(url).hostname.toLowerCase(); } catch { setStatus('❌ Invalid URL', 'var(--red)'); return; }
+  }
+  const wasEditing = !!editingHost;
 
   // Save per-host rule to profile.json (also remembers a sample URL for reference)
   await saveUserRule(host, ref || '', orig || '', proxyMode, proxyFmt, customUrl, url);
@@ -592,6 +636,8 @@ async function saveCurrentRule() {
   localStorage.setItem('megaplayer_proxy_mode', proxyMode);
   localStorage.setItem('megaplayer_proxy_fmt',  proxyFmt);
   localStorage.setItem('megaplayer_proxy_custom_url', customUrl);
+
+  if (wasEditing) cancelEditRule(); // exit edit mode, restore button UI
 
   const parts = [];
   if (ref || orig) parts.push('headers');
@@ -625,7 +671,8 @@ async function renderSavedRules(data) {
 }
 
 // Click a saved rule → loads its sample URL, referer, origin & proxy settings
-// back into the form so you can see exactly what's saved (and play it again).
+// back into the form AND enters edit mode, so you can tweak anything and
+// click "Update Rule" to save changes back to that same saved profile.
 async function applyRule(host) {
   const data = await loadUserRules();
   const d = data[host];
@@ -645,8 +692,19 @@ async function applyRule(host) {
   if (d.customUrl && document.getElementById('customProxyUrl'))
     document.getElementById('customProxyUrl').value = d.customUrl;
 
+  editingHost = host;
+  document.getElementById('btnSaveRule').textContent = `✏️ Update "${host}"`;
+  document.getElementById('btnCancelEdit').style.display = '';
+
   const proxyText = d.proxyMode ? d.proxyMode : 'direct (no proxy)';
-  setStatus(`📂 Loaded saved rule for ${host} — proxy: ${proxyText}`, 'var(--acc2)');
+  setStatus(`✏️ Editing saved rule for ${host} — proxy: ${proxyText}. Change anything, then click Update.`, 'var(--acc2)');
+}
+
+// Exit edit mode without saving — restores the normal "Save Rule" button.
+function cancelEditRule() {
+  editingHost = null;
+  document.getElementById('btnSaveRule').textContent = '💾 Save Rule';
+  document.getElementById('btnCancelEdit').style.display = 'none';
 }
 
 // ════════════════════════════════════════════════════════════
